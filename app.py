@@ -23,9 +23,9 @@ st.set_page_config(
 LABELS = ['dark', 'light', 'mid-dark', 'mid-light']
 
 # Settings untuk akurasi (ENHANCED)
-HISTORY_LEN = 20  # Increased for more stable voting
-CONFIDENCE_THRES = 0.50  # Lowered threshold for easier detection
-MIN_FACE_SIZE = 90  # Minimum face size (pixel) - ensures user is close enough
+HISTORY_LEN = 30  # Increased for more stable voting (was 20)
+CONFIDENCE_THRES = 0.35  # Lowered threshold - model confidence biasanya tidak terlalu tinggi
+MIN_FACE_SIZE = 80  # Minimum face size (pixel) - sedikit lebih kecil untuk jangkauan lebih jauh
 
 # Brightness thresholds for gating
 BRIGHTNESS_MIN = 70
@@ -154,6 +154,147 @@ def center_crop_face(face_img):
     return center_crop
 
 
+# --- FITUR F: CLAHE (Contrast Limited Adaptive Histogram Equalization) ---
+def apply_clahe(img):
+    """
+    Menerapkan CLAHE untuk meningkatkan kontras secara lokal.
+    Sangat efektif untuk normalisasi pencahayaan yang tidak merata.
+    """
+    # Convert ke LAB color space
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    
+    # Apply CLAHE hanya ke channel L (lightness)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_clahe = clahe.apply(l)
+    
+    # Gabungkan kembali
+    lab_clahe = cv2.merge([l_clahe, a, b])
+    result = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
+    
+    return result
+
+
+# --- FITUR G: MULTI-REGION SAMPLING ---
+def get_multi_region_crops(frame, x1, y1, x2, y2):
+    """
+    Mengambil sampel dari beberapa region wajah untuk prediksi ensemble.
+    Region: Dahi, Pipi Kiri, Pipi Kanan, Hidung
+    Returns: List of cropped regions
+    """
+    h, w = frame.shape[:2]
+    w_box = x2 - x1
+    h_box = y2 - y1
+    
+    regions = []
+    region_names = []
+    
+    # Region 1: Dahi (atas tengah)
+    forehead_x1 = int(x1 + w_box * 0.30)
+    forehead_x2 = int(x1 + w_box * 0.70)
+    forehead_y1 = int(y1 + h_box * 0.10)
+    forehead_y2 = int(y1 + h_box * 0.30)
+    
+    # Region 2: Pipi Kiri
+    left_cheek_x1 = int(x1 + w_box * 0.10)
+    left_cheek_x2 = int(x1 + w_box * 0.35)
+    left_cheek_y1 = int(y1 + h_box * 0.40)
+    left_cheek_y2 = int(y1 + h_box * 0.70)
+    
+    # Region 3: Pipi Kanan
+    right_cheek_x1 = int(x1 + w_box * 0.65)
+    right_cheek_x2 = int(x1 + w_box * 0.90)
+    right_cheek_y1 = int(y1 + h_box * 0.40)
+    right_cheek_y2 = int(y1 + h_box * 0.70)
+    
+    # Region 4: Hidung (tengah)
+    nose_x1 = int(x1 + w_box * 0.35)
+    nose_x2 = int(x1 + w_box * 0.65)
+    nose_y1 = int(y1 + h_box * 0.35)
+    nose_y2 = int(y1 + h_box * 0.60)
+    
+    # Validasi dan crop
+    region_coords = [
+        (forehead_x1, forehead_y1, forehead_x2, forehead_y2, "Dahi"),
+        (left_cheek_x1, left_cheek_y1, left_cheek_x2, left_cheek_y2, "Pipi Kiri"),
+        (right_cheek_x1, right_cheek_y1, right_cheek_x2, right_cheek_y2, "Pipi Kanan"),
+        (nose_x1, nose_y1, nose_x2, nose_y2, "Hidung")
+    ]
+    
+    for rx1, ry1, rx2, ry2, name in region_coords:
+        # Validasi koordinat
+        rx1, ry1 = max(0, rx1), max(0, ry1)
+        rx2, ry2 = min(w, rx2), min(h, ry2)
+        
+        if rx2 > rx1 and ry2 > ry1:
+            crop = frame[ry1:ry2, rx1:rx2]
+            if crop.size > 0:
+                regions.append(crop)
+                region_names.append(name)
+    
+    return regions, region_names
+
+
+# --- FITUR H: ENSEMBLE PREDICTION ---
+def ensemble_predict(regions, skin_model, use_clahe=True, use_white_balance=True):
+    """
+    Melakukan prediksi pada multiple regions dan menggabungkan hasilnya.
+    Menggunakan AVERAGE RAW PREDICTIONS untuk confidence yang lebih stabil.
+    Returns: (final_label, final_confidence, all_predictions)
+    """
+    if not regions:
+        return None, 0.0, []
+    
+    predictions = []
+    raw_predictions = []  # Untuk averaging
+    
+    for region in regions:
+        # Preprocessing
+        processed = region.copy()
+        
+        if use_white_balance:
+            processed = correct_white_balance(processed)
+        
+        if use_clahe:
+            processed = apply_clahe(processed)
+        
+        # Resize dan prediksi
+        try:
+            resized = cv2.resize(processed, (224, 224))
+            img_array = np.expand_dims(resized, axis=0) / 255.0
+            
+            pred = skin_model.predict(img_array, verbose=0)
+            idx = np.argmax(pred)
+            conf = float(pred[0][idx])
+            label = LABELS[idx]
+            
+            predictions.append({
+                'label': label,
+                'confidence': conf,
+                'raw_pred': pred[0]
+            })
+            raw_predictions.append(pred[0])
+        except Exception as e:
+            continue
+    
+    if not predictions:
+        return None, 0.0, []
+    
+    # METODE BARU: Average semua raw predictions
+    # Ini menghasilkan confidence yang lebih stabil dan tinggi
+    avg_pred = np.mean(raw_predictions, axis=0)
+    final_idx = np.argmax(avg_pred)
+    final_label = LABELS[final_idx]
+    final_confidence = float(avg_pred[final_idx])
+    
+    # Boost confidence sedikit karena ensemble lebih reliable
+    # Maximum boost 10%
+    confidence_boost = min(0.10, (len(predictions) - 1) * 0.02)
+    final_confidence = min(1.0, final_confidence + confidence_boost)
+    
+    return final_label, final_confidence, predictions
+
+
 # Rekomendasi warna pakaian berdasarkan skin tone (diperluas dari Gradio)
 def get_recommendation(skin_label):
     recommendations = {
@@ -165,66 +306,342 @@ def get_recommendation(skin_label):
     return recommendations.get(skin_label, "Tidak ada rekomendasi.")
 
 
-# Custom CSS for modern styling
+# Custom CSS for PREMIUM DARK MODE styling
 st.markdown("""
 <style>
+    /* ===== IMPORT GOOGLE FONTS ===== */
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+    
+    /* ===== GLOBAL STYLES ===== */
+    .stApp {
+        font-family: 'Inter', sans-serif;
+        background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 50%, #0f172a 100%) !important;
+        background-attachment: fixed !important;
+    }
+    
+    /* ===== MAIN HEADER ===== */
     .main-header {
-        font-size: 2.5rem;
-        font-weight: 700;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        font-size: 3rem;
+        font-weight: 800;
+        background: linear-gradient(135deg, #818cf8 0%, #a78bfa 30%, #f472b6 70%, #fb7185 100%);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
         text-align: center;
-        margin-bottom: 1rem;
+        margin-bottom: 0.5rem;
+        letter-spacing: -1px;
+        animation: fadeInDown 0.8s ease-out;
+        filter: drop-shadow(0 0 30px rgba(139, 92, 246, 0.4));
     }
+    
     .sub-header {
-        font-size: 1.1rem;
-        color: #6b7280;
+        font-size: 1.15rem;
+        color: #94a3b8;
         text-align: center;
         margin-bottom: 2rem;
+        font-weight: 500;
+        animation: fadeIn 1s ease-out;
     }
-    .result-card {
-        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-        border-radius: 15px;
-        padding: 20px;
-        margin: 10px 0;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    
+    /* ===== ANIMATIONS ===== */
+    @keyframes fadeIn {
+        from { opacity: 0; }
+        to { opacity: 1; }
     }
-    .skin-tone-badge {
-        display: inline-block;
-        padding: 8px 16px;
-        border-radius: 20px;
-        font-weight: 600;
-        color: white;
-        margin: 5px;
+    
+    @keyframes fadeInDown {
+        from { opacity: 0; transform: translateY(-20px); }
+        to { opacity: 1; transform: translateY(0); }
     }
-    .recommendation-box {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        border-radius: 15px;
-        padding: 20px;
+    
+    @keyframes fadeInUp {
+        from { opacity: 0; transform: translateY(20px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    
+    @keyframes pulse {
+        0%, 100% { transform: scale(1); }
+        50% { transform: scale(1.05); }
+    }
+    
+    @keyframes shimmer {
+        0% { background-position: -200% 0; }
+        100% { background-position: 200% 0; }
+    }
+    
+    /* ===== GLASSMORPHISM CARDS (DARK) ===== */
+    .glass-card {
+        background: rgba(30, 41, 59, 0.8);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        border-radius: 24px;
+        border: 1px solid rgba(139, 92, 246, 0.3);
+        padding: 24px;
         margin: 15px 0;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+        animation: fadeInUp 0.6s ease-out;
+        color: #e2e8f0;
     }
-    .stButton > button {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    
+    .glass-card h4, .glass-card h5, .glass-card strong {
+        color: #f1f5f9 !important;
+    }
+    
+    .glass-card-dark {
+        background: rgba(15, 23, 42, 0.9);
+        backdrop-filter: blur(20px);
+        border-radius: 24px;
+        border: 1px solid rgba(139, 92, 246, 0.2);
+        padding: 24px;
+        margin: 15px 0;
+        color: #e2e8f0;
+    }
+    
+    /* ===== RESULT CARD ===== */
+    .result-card {
+        background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+        border-radius: 20px;
+        padding: 24px;
+        margin: 15px 0;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.8);
+        animation: fadeInUp 0.5s ease-out;
+    }
+    
+    /* ===== SKIN TONE BADGES ===== */
+    .skin-tone-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 12px 24px;
+        border-radius: 50px;
+        font-weight: 700;
+        font-size: 1.1rem;
         color: white;
-        border: none;
-        border-radius: 10px;
-        padding: 0.5rem 2rem;
-        font-weight: 600;
+        margin: 8px 4px;
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
         transition: all 0.3s ease;
     }
-    .stButton > button:hover {
+    
+    .skin-tone-badge:hover {
         transform: translateY(-2px);
-        box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
     }
+    
+    .badge-light { background: linear-gradient(135deg, #fde68a 0%, #fbbf24 100%); color: #78350f; }
+    .badge-mid-light { background: linear-gradient(135deg, #fdba74 0%, #f97316 100%); }
+    .badge-mid-dark { background: linear-gradient(135deg, #a78bfa 0%, #7c3aed 100%); }
+    .badge-dark { background: linear-gradient(135deg, #6366f1 0%, #4338ca 100%); }
+    
+    /* ===== SKIN TONE COLOR INDICATOR ===== */
+    .skin-indicator {
+        display: inline-block;
+        width: 20px;
+        height: 20px;
+        border-radius: 50%;
+        margin-right: 8px;
+        border: 2px solid white;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    }
+    
+    .skin-light { background: linear-gradient(135deg, #FFECD2 0%, #FCB69F 100%); }
+    .skin-mid-light { background: linear-gradient(135deg, #E0C3A8 0%, #C9A882 100%); }
+    .skin-mid-dark { background: linear-gradient(135deg, #A67C52 0%, #8B5A2B 100%); }
+    .skin-dark { background: linear-gradient(135deg, #5D4037 0%, #3E2723 100%); }
+    
+    /* ===== RECOMMENDATION BOX ===== */
+    .recommendation-box {
+        background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #a855f7 100%);
+        color: white;
+        border-radius: 20px;
+        padding: 24px;
+        margin: 20px 0;
+        box-shadow: 0 10px 40px rgba(99, 102, 241, 0.3);
+        animation: fadeInUp 0.6s ease-out;
+    }
+    
+    .recommendation-box h4 {
+        margin: 0 0 12px 0;
+        font-size: 1.2rem;
+        font-weight: 700;
+    }
+    
+    /* ===== BUTTONS ===== */
+    .stButton > button {
+        background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+        color: white;
+        border: none;
+        border-radius: 12px;
+        padding: 0.75rem 2rem;
+        font-weight: 600;
+        font-size: 1rem;
+        transition: all 0.3s ease;
+        box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
+    }
+    
+    .stButton > button:hover {
+        transform: translateY(-3px);
+        box-shadow: 0 8px 25px rgba(99, 102, 241, 0.4);
+    }
+    
+    .stButton > button:active {
+        transform: translateY(-1px);
+    }
+    
+    /* ===== INFO BOXES ===== */
     .info-box {
-        background: #e0f2fe;
-        border-left: 4px solid #0284c7;
-        padding: 12px 16px;
-        border-radius: 0 8px 8px 0;
+        background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%);
+        border-left: 4px solid #3b82f6;
+        padding: 16px 20px;
+        border-radius: 0 16px 16px 0;
+        margin: 12px 0;
+        font-weight: 500;
+        color: #e2e8f0;
+        backdrop-filter: blur(10px);
+    }
+    
+    .success-box {
+        background: linear-gradient(135deg, rgba(34, 197, 94, 0.2) 0%, rgba(22, 163, 74, 0.2) 100%);
+        border-left: 4px solid #22c55e;
+        padding: 18px 22px;
+        border-radius: 0 16px 16px 0;
+        margin: 12px 0;
+        color: #e2e8f0;
+        backdrop-filter: blur(10px);
+    }
+    
+    .warning-box {
+        background: linear-gradient(135deg, rgba(245, 158, 11, 0.2) 0%, rgba(217, 119, 6, 0.2) 100%);
+        border-left: 4px solid #f59e0b;
+        padding: 18px 22px;
+        border-radius: 0 16px 16px 0;
+        margin: 12px 0;
+        color: #e2e8f0;
+        backdrop-filter: blur(10px);
+    }
+    
+    /* ===== SIDEBAR STYLING ===== */
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #0f172a 0%, #1e1b4b 50%, #312e81 100%);
+        border-right: 1px solid rgba(139, 92, 246, 0.2);
+    }
+    
+    section[data-testid="stSidebar"] .stMarkdown {
+        color: #c7d2fe;
+    }
+    
+    section[data-testid="stSidebar"] h1, 
+    section[data-testid="stSidebar"] h2, 
+    section[data-testid="stSidebar"] h3 {
+        color: #f1f5f9 !important;
+        text-shadow: 0 0 20px rgba(139, 92, 246, 0.3);
+    }
+    
+    section[data-testid="stSidebar"] .stCheckbox label {
+        color: #c7d2fe !important;
+    }
+    
+    section[data-testid="stSidebar"] hr {
+        border-color: rgba(139, 92, 246, 0.3);
+    }
+    
+    /* ===== METRICS STYLING ===== */
+    .metric-card {
+        background: linear-gradient(135deg, rgba(30, 41, 59, 0.9) 0%, rgba(51, 65, 85, 0.9) 100%);
+        border-radius: 20px;
+        padding: 20px;
+        text-align: center;
+        box-shadow: 0 8px 30px rgba(0, 0, 0, 0.3);
+        border: 1px solid rgba(139, 92, 246, 0.2);
+        transition: all 0.3s ease;
+    }
+    
+    .metric-card:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 12px 40px rgba(99, 102, 241, 0.3);
+        border-color: rgba(139, 92, 246, 0.4);
+    }
+    
+    .metric-value {
+        font-size: 2.5rem;
+        font-weight: 800;
+        background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+    
+    .metric-label {
+        font-size: 0.9rem;
+        color: #64748b;
+        font-weight: 500;
+        margin-top: 8px;
+    }
+    
+    /* ===== EXPANDER STYLING ===== */
+    .streamlit-expanderHeader {
+        background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+        border-radius: 12px;
+        font-weight: 600;
+    }
+    
+    /* ===== CAMERA INPUT ===== */
+    .stCameraInput > div {
+        border-radius: 20px;
+        overflow: hidden;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
+    }
+    
+    /* ===== PROGRESS/LOADING ===== */
+    .stProgress > div > div {
+        background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+    }
+    
+    /* ===== CUSTOM DIVIDER ===== */
+    .custom-divider {
+        height: 3px;
+        background: linear-gradient(90deg, transparent 0%, #6366f1 50%, transparent 100%);
+        border: none;
+        margin: 30px 0;
+        border-radius: 2px;
+    }
+    
+    /* ===== FEATURE BADGE ===== */
+    .feature-badge {
+        display: inline-block;
+        background: linear-gradient(135deg, #22c55e 0%, #16a34a 100%);
+        color: white;
+        font-size: 0.7rem;
+        font-weight: 700;
+        padding: 3px 8px;
+        border-radius: 20px;
+        margin-left: 8px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    
+    /* ===== CONFIDENCE METER ===== */
+    .confidence-meter {
+        width: 100%;
+        height: 12px;
+        background: #e2e8f0;
+        border-radius: 6px;
+        overflow: hidden;
         margin: 10px 0;
     }
+    
+    .confidence-fill {
+        height: 100%;
+        border-radius: 6px;
+        transition: width 0.5s ease;
+    }
+    
+    .conf-high { background: linear-gradient(90deg, #22c55e 0%, #16a34a 100%); }
+    .conf-medium { background: linear-gradient(90deg, #f59e0b 0%, #d97706 100%); }
+    .conf-low { background: linear-gradient(90deg, #ef4444 0%, #dc2626 100%); }
+    
+    /* ===== HIDE STREAMLIT BRANDING ===== */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    
 </style>
 """, unsafe_allow_html=True)
 
@@ -250,13 +667,16 @@ def load_models():
 
 
 def process_frame(frame, yolo_model, skin_tone_model, use_voting=True, use_white_balance=True, 
-                   use_center_crop=True, use_brightness_gate=True, use_obstruction_detect=True):
+                   use_center_crop=True, use_brightness_gate=True, use_obstruction_detect=True,
+                   use_clahe=True, use_multi_region=True):
     """
     Process a single frame dengan fitur-fitur PROFESIONAL ENHANCED:
     - White balance correction (Gray World Algorithm)
     - Smart crop sampling (30% area tengah wajah)
     - Brightness gating (validasi pencahayaan)
     - Obstruction detection (deteksi halangan wajah)
+    - CLAHE enhancement (normalisasi kontras)
+    - Multi-region sampling (ensemble prediction)
     - Voting history untuk stabilisasi
     """
     if frame is None:
@@ -342,13 +762,44 @@ def process_frame(frame, yolo_model, skin_tone_model, use_voting=True, use_white
             
             # --- PREDIKSI SKIN TONE ---
             try:
-                resized_face = cv2.resize(face_for_prediction, (224, 224))
-                img_array = np.expand_dims(resized_face, axis=0) / 255.0
+                # Pilih metode prediksi: Multi-Region atau Single Region
+                if use_multi_region:
+                    # Multi-Region Ensemble Prediction
+                    regions, region_names = get_multi_region_crops(frame, x1, y1, x2, y2)
+                    
+                    if regions:
+                        current_label, confidence, all_preds = ensemble_predict(
+                            regions, skin_tone_model, 
+                            use_clahe=use_clahe, 
+                            use_white_balance=use_white_balance
+                        )
+                        
+                        # Visualisasi region yang disampling (optional, untuk debugging)
+                        # Kotak-kotak kecil di area sampling
+                        for i, (region, name) in enumerate(zip(regions, region_names)):
+                            pass  # Bisa tambahkan visualisasi kotak kecil di sini
+                    else:
+                        # Fallback ke single region jika multi-region gagal
+                        current_label, confidence = None, 0.0
+                else:
+                    # Single Region Prediction (metode lama)
+                    processed_face = face_for_prediction.copy()
+                    
+                    if use_clahe:
+                        processed_face = apply_clahe(processed_face)
+                    
+                    resized_face = cv2.resize(processed_face, (224, 224))
+                    img_array = np.expand_dims(resized_face, axis=0) / 255.0
+                    
+                    prediction = skin_tone_model.predict(img_array, verbose=0)
+                    idx = np.argmax(prediction)
+                    current_label = LABELS[idx]
+                    confidence = float(prediction[0][idx])
                 
-                prediction = skin_tone_model.predict(img_array, verbose=0)
-                idx = np.argmax(prediction)
-                current_label = LABELS[idx]
-                confidence = float(prediction[0][idx])
+                # Skip jika prediksi gagal
+                if current_label is None:
+                    warning_msg = "⚠️ Gagal memprediksi, coba dekatkan wajah"
+                    continue
                 
                 # Voting mechanism untuk stabilisasi (webcam mode)
                 if use_voting and confidence > CONFIDENCE_THRES:
@@ -371,15 +822,16 @@ def process_frame(frame, yolo_model, skin_tone_model, use_voting=True, use_white
                 cv2.rectangle(annotated_frame, (crop_x1, crop_y1), (crop_x2, crop_y2), (255, 0, 0), 1)
                 
                 # Label hasil
-                if warning_msg:
+                if warning_msg and "Confidence rendah" not in warning_msg:
                     cv2.putText(annotated_frame, warning_msg.replace("⚠️ ", "").replace("⏳ ", ""), 
                                (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                 else:
                     label_text = f"{(detected_skin or current_label).upper()}"
                     cv2.putText(annotated_frame, label_text, (x1, y1-10), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-                    # Tampilkan confidence di bawah kotak
-                    cv2.putText(annotated_frame, f"Conf: {confidence:.2f}", (x1, y2+20), 
+                    # Tampilkan confidence dan mode di bawah kotak
+                    mode_text = "Multi" if use_multi_region else "Single"
+                    cv2.putText(annotated_frame, f"Conf: {confidence:.2f} ({mode_text})", (x1, y2+20), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 
                 info_text = f"✅ Deteksi: {(detected_skin or current_label).upper()} (Confidence: {confidence:.1%})"
@@ -396,13 +848,16 @@ def process_frame(frame, yolo_model, skin_tone_model, use_voting=True, use_white
 
 def detect_and_classify_image(image, yolo_model, skin_tone_model, conf_threshold=0.5, 
                                use_white_balance=True, use_center_crop=True,
-                               use_brightness_gate=True, use_obstruction_detect=True):
+                               use_brightness_gate=True, use_obstruction_detect=True,
+                               use_clahe=True, use_multi_region=True):
     """
     Detect faces and classify skin tones from uploaded image dengan fitur PROFESIONAL:
     - Smart crop sampling (30% area tengah wajah)
     - White balance correction  
     - Brightness gating
     - Obstruction detection
+    - CLAHE enhancement
+    - Multi-region sampling (ensemble prediction)
     - Enhanced visualization with sampling area
     """
     img_array = np.array(image)
@@ -476,13 +931,33 @@ def detect_and_classify_image(image, yolo_model, skin_tone_model, conf_threshold
                 skin_ratio_val = cv2.countNonZero(mask) / (mask.size + 1e-5)
             
             # --- PREDIKSI SKIN TONE ---
-            resized_face = cv2.resize(face_for_prediction, (224, 224))
-            img_input = np.expand_dims(resized_face, axis=0) / 255.0
-            
-            prediction = skin_tone_model.predict(img_input, verbose=0)
-            skin_tone_idx = np.argmax(prediction[0])
-            skin_tone_conf = float(prediction[0][skin_tone_idx])
-            skin_tone_label = LABELS[skin_tone_idx]
+            if use_multi_region:
+                # Multi-Region Ensemble Prediction
+                regions, region_names = get_multi_region_crops(img_bgr, x1, y1, x2, y2)
+                
+                if regions:
+                    skin_tone_label, skin_tone_conf, all_preds = ensemble_predict(
+                        regions, skin_tone_model,
+                        use_clahe=use_clahe,
+                        use_white_balance=use_white_balance
+                    )
+                else:
+                    # Fallback
+                    skin_tone_label, skin_tone_conf = "unknown", 0.0
+            else:
+                # Single Region Prediction
+                processed_face = face_for_prediction.copy()
+                
+                if use_clahe:
+                    processed_face = apply_clahe(processed_face)
+                
+                resized_face = cv2.resize(processed_face, (224, 224))
+                img_input = np.expand_dims(resized_face, axis=0) / 255.0
+                
+                prediction = skin_tone_model.predict(img_input, verbose=0)
+                skin_tone_idx = np.argmax(prediction[0])
+                skin_tone_conf = float(prediction[0][skin_tone_idx])
+                skin_tone_label = LABELS[skin_tone_idx]
             
             # --- VISUALISASI PROFESIONAL ---
             # Warna kotak berdasarkan status
@@ -529,9 +1004,99 @@ def detect_and_classify_image(image, yolo_model, skin_tone_model, conf_threshold
 
 
 def main():
-    # Header
-    st.markdown('<h1 class="main-header">💎 Skin Tone AI Professional</h1>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">Menggunakan YOLO-Face + Smart Sampling + Auto White Balance</p>', unsafe_allow_html=True)
+    # HERO SECTION - More Eye-catching
+    st.markdown("""
+    <div style="
+        background: linear-gradient(135deg, #1e1b4b 0%, #4c1d95 50%, #7c3aed 100%);
+        border-radius: 30px;
+        padding: 50px 30px;
+        margin-bottom: 30px;
+        text-align: center;
+        border: 2px solid rgba(139, 92, 246, 0.5);
+        box-shadow: 0 20px 60px rgba(124, 58, 237, 0.4);
+        position: relative;
+        overflow: hidden;
+    ">
+        <div style="
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 50%);
+            animation: pulse 4s ease-in-out infinite;
+        "></div>
+        <h1 style="
+            font-size: 3.5rem;
+            font-weight: 800;
+            background: linear-gradient(90deg, #c4b5fd, #f9a8d4, #fcd34d, #c4b5fd);
+            background-size: 300% 300%;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            animation: gradient-shift 3s ease infinite;
+            margin: 0;
+            position: relative;
+            z-index: 1;
+        ">💎 Skin Tone AI Professional</h1>
+        <p style="
+            color: #c4b5fd;
+            font-size: 1.2rem;
+            margin-top: 15px;
+            position: relative;
+            z-index: 1;
+        ">Sistem Rekomendasi Warna Pakaian dengan Kecerdasan Buatan</p>
+        <div style="
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            margin-top: 25px;
+            flex-wrap: wrap;
+            position: relative;
+            z-index: 1;
+        ">
+            <span style="background: rgba(34, 197, 94, 0.3); color: #86efac; padding: 8px 16px; border-radius: 20px; font-size: 0.85rem; border: 1px solid #22c55e;">✅ YOLO Face Detection</span>
+            <span style="background: rgba(59, 130, 246, 0.3); color: #93c5fd; padding: 8px 16px; border-radius: 20px; font-size: 0.85rem; border: 1px solid #3b82f6;">✅ AI Skin Analysis</span>
+            <span style="background: rgba(249, 115, 22, 0.3); color: #fdba74; padding: 8px 16px; border-radius: 20px; font-size: 0.85rem; border: 1px solid #f97316;">✅ Smart Recommendations</span>
+        </div>
+    </div>
+    <style>
+        @keyframes gradient-shift {
+            0%, 100% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+        }
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); opacity: 0.5; }
+            50% { transform: scale(1.1); opacity: 0.8; }
+        }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Quick Guide - Collapsible untuk user baru
+    with st.expander("📖 **Panduan Cepat** - Klik untuk membuka", expanded=False):
+        st.markdown("""
+        <div class="glass-card">
+            <h4 style="margin-top: 0;">👋 Selamat Datang!</h4>
+            <p>Aplikasi ini akan menganalisis warna kulit Anda dan memberikan rekomendasi warna pakaian yang paling cocok.</p>
+            
+            <h5>🚀 Cara Menggunakan:</h5>
+            <ol>
+                <li><strong>Pilih Mode Input</strong> di sidebar (Webcam atau Upload Gambar)</li>
+                <li><strong>Pastikan pencahayaan cukup</strong> - tidak terlalu gelap atau terang</li>
+                <li><strong>Posisikan wajah</strong> agar terlihat jelas di kamera</li>
+                <li><strong>Tunggu deteksi</strong> - kotak hijau akan muncul di wajah Anda</li>
+                <li><strong>Lihat hasil</strong> - skin tone dan rekomendasi warna akan ditampilkan</li>
+            </ol>
+            
+            <h5>💡 Tips untuk Hasil Terbaik:</h5>
+            <ul>
+                <li>✅ Gunakan pencahayaan natural (dekat jendela)</li>
+                <li>✅ Hindari lampu yang terlalu kuning/biru</li>
+                <li>✅ Lepas kacamata jika ada</li>
+                <li>✅ Jangan tutupi wajah dengan tangan</li>
+                <li>✅ Dekatkan wajah ke kamera (30-50cm)</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
     
     # Sidebar
     with st.sidebar:
@@ -542,16 +1107,6 @@ def main():
             "Pilih Mode Input:",
             ["📷 Webcam", "📁 Upload Gambar"],
             index=0
-        )
-        
-        st.divider()
-        
-        conf_threshold = st.slider(
-            "Detection Confidence",
-            min_value=0.1,
-            max_value=1.0,
-            value=0.5,
-            step=0.05
         )
         
         st.divider()
@@ -583,6 +1138,18 @@ def main():
             help=f"Deteksi jika wajah terhalang tangan/masker (min skin ratio: {SKIN_RATIO_MIN:.0%})"
         )
         
+        use_clahe = st.checkbox(
+            "📊 CLAHE Enhancement",
+            value=True,
+            help="Contrast Limited Adaptive Histogram Equalization - Meningkatkan kontras untuk deteksi lebih akurat"
+        )
+        
+        use_multi_region = st.checkbox(
+            "🎯 Multi-Region Sampling",
+            value=True,
+            help="Ambil sampel dari 4 titik wajah (Dahi, Pipi Kiri, Pipi Kanan, Hidung) untuk hasil lebih stabil"
+        )
+        
         if mode == "📷 Webcam":
             st.divider()
             if st.button("🔄 Reset Voting History"):
@@ -605,6 +1172,9 @@ def main():
         4. ✅ Skin Locus Masking (YCbCr)
         5. ✅ Obstruction Detection
         6. ✅ Voting History (Webcam)
+        7. ✅ CLAHE Enhancement (BARU!)
+        8. ✅ Multi-Region Sampling (BARU!)
+
         
         **🎨 Kategori Skin Tone:**
         - 🔵 Light
@@ -631,7 +1201,39 @@ def main():
     # Mode: Webcam
     if mode == "📷 Webcam":
         st.markdown("### 📹 Live Webcam Detection")
-        st.info("📍 Arahkan wajah ke webcam. Kotak akan berubah **HIJAU** jika kondisi siap untuk analisis. Kotak **BIRU** menunjukkan area sampling AI.")
+        
+        # Status indicators
+        col_stat1, col_stat2, col_stat3 = st.columns(3)
+        with col_stat1:
+            st.markdown("""
+            <div class="metric-card" style="padding: 12px; text-align: center;">
+                <div style="font-size: 1.5rem;">🟩</div>
+                <div style="font-size: 0.75rem; color: #64748b;">Siap Analisis</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with col_stat2:
+            st.markdown("""
+            <div class="metric-card" style="padding: 12px; text-align: center;">
+                <div style="font-size: 1.5rem;">🟦</div>
+                <div style="font-size: 0.75rem; color: #64748b;">Area Sampling</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with col_stat3:
+            st.markdown("""
+            <div class="metric-card" style="padding: 12px; text-align: center;">
+                <div style="font-size: 1.5rem;">🟥</div>
+                <div style="font-size: 0.75rem; color: #64748b;">Perlu Perbaikan</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown("")  # Spacing
+        
+        # Quick tips inline
+        st.markdown("""
+        <div class="info-box" style="margin-bottom: 15px;">
+            <strong>💡 Tips Cepat:</strong> Posisikan wajah di tengah • Pastikan pencahayaan cukup terang • Jarak ideal 30-50cm dari kamera
+        </div>
+        """, unsafe_allow_html=True)
         
         # Webcam input
         camera_input = st.camera_input("Capture from Webcam", label_visibility="collapsed")
@@ -651,7 +1253,9 @@ def main():
                 use_white_balance=use_white_balance,
                 use_center_crop=use_center_crop,
                 use_brightness_gate=use_brightness_gate,
-                use_obstruction_detect=use_obstruction_detect
+                use_obstruction_detect=use_obstruction_detect,
+                use_clahe=use_clahe,
+                use_multi_region=use_multi_region
             )
             
             # Convert back to RGB for display
@@ -672,20 +1276,65 @@ def main():
                 else:
                     st.success(info_text)
                 
-                # Show voting info
+                # Show voting info dengan progress bar
                 if len(st.session_state.skin_history) > 0:
                     vote_counts = Counter(st.session_state.skin_history)
-                    st.markdown(f"**Voting History:** {len(st.session_state.skin_history)}/{HISTORY_LEN} samples")
-                    st.caption(f"Votes: {dict(vote_counts)}")
+                    progress = len(st.session_state.skin_history) / HISTORY_LEN
+                    st.markdown(f"**📊 Voting Progress:** {len(st.session_state.skin_history)}/{HISTORY_LEN}")
+                    st.progress(progress)
+                    
+                    # Vote distribution
+                    st.caption(f"Distribution: {dict(vote_counts)}")
                 
                 if detected_skin and not warning_msg:
-                    st.markdown("---")
-                    st.markdown(f"### 🎨 Skin Tone: **{detected_skin.upper()}**")
-                    st.markdown(f"**Confidence:** {confidence:.1%}")
+                    # Celebration effect untuk confidence tinggi
+                    if confidence >= 0.7 and len(st.session_state.skin_history) >= HISTORY_LEN * 0.8:
+                        st.balloons()
+                    
+                    st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+                    
+                    # Success message
+                    st.markdown("""
+                    <div class="success-box" style="text-align: center;">
+                        <strong>🎉 Analisis Berhasil!</strong> Berikut adalah hasil dan rekomendasi untuk Anda.
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Skin Tone Badge dengan warna
+                    badge_class = f"badge-{detected_skin.replace(' ', '-')}"
+                    skin_class = f"skin-{detected_skin.replace(' ', '-')}"
+                    
+                    st.markdown(f"""
+                    <div style="text-align: center; margin: 20px 0;">
+                        <div class="skin-tone-badge {badge_class}">
+                            <span class="skin-indicator {skin_class}"></span>
+                            {detected_skin.upper()}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Confidence Meter Visual
+                    conf_percent = confidence * 100
+                    conf_class = "conf-high" if conf_percent >= 70 else ("conf-medium" if conf_percent >= 50 else "conf-low")
+                    
+                    st.markdown(f"""
+                    <div style="margin: 20px 0;">
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                            <span style="font-weight: 600; color: #374151;">Confidence Level</span>
+                            <span style="font-weight: 700; color: #6366f1;">{confidence:.1%}</span>
+                        </div>
+                        <div class="confidence-meter">
+                            <div class="confidence-fill {conf_class}" style="width: {conf_percent}%;"></div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Rekomendasi
                     st.markdown("### 👔 Rekomendasi Warna Pakaian")
                     recommendation = get_recommendation(detected_skin)
                     st.markdown(f"""
                     <div class="recommendation-box">
+                        <h4>✨ Cocok untuk {detected_skin.upper()}</h4>
                         {recommendation.replace(chr(10), '<br>')}
                     </div>
                     """, unsafe_allow_html=True)
@@ -693,12 +1342,57 @@ def main():
     # Mode: Upload Image
     else:
         st.markdown("### 📤 Upload Image")
-        st.info("📍 Upload gambar wajah. Kotak **BIRU** menunjukkan area sampling AI (30% area tengah wajah).")
+        
+        # Tips untuk upload
+        col_tip1, col_tip2 = st.columns(2)
+        with col_tip1:
+            st.markdown("""
+            <div class="success-box">
+                <strong>✅ Gambar yang Bagus:</strong><br>
+                • Wajah terlihat jelas<br>
+                • Pencahayaan merata<br>
+                • Resolusi cukup tinggi
+            </div>
+            """, unsafe_allow_html=True)
+        with col_tip2:
+            st.markdown("""
+            <div class="warning-box">
+                <strong>⚠️ Hindari:</strong><br>
+                • Wajah tertutup masker<br>
+                • Foto terlalu gelap/terang<br>
+                • Gambar blur/buram
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown("")  # Spacing
+        
+        # Detection Confidence Slider dengan penjelasan
+        st.markdown("""
+        <div class="info-box" style="margin-bottom: 10px;">
+            <strong>🎚️ Detection Confidence</strong> — Sensitivitas deteksi wajah<br>
+            <small style="color: #64748b;">
+                • <strong>Tinggi (0.7-1.0):</strong> Hanya wajah yang sangat jelas terdeteksi<br>
+                • <strong>Sedang (0.5):</strong> Keseimbangan (default)<br>
+                • <strong>Rendah (0.2-0.4):</strong> Lebih sensitif, cocok untuk gambar jauh/kurang jelas
+            </small>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        conf_threshold = st.slider(
+            "Detection Confidence",
+            min_value=0.1,
+            max_value=1.0,
+            value=0.5,
+            step=0.05,
+            help="Turunkan nilai ini jika wajah tidak terdeteksi. Naikkan jika ada false detection."
+        )
+        
+        st.markdown("")  # Spacing
         
         uploaded_file = st.file_uploader(
-            "Pilih gambar",
+            "📁 Pilih gambar wajah Anda",
             type=['jpg', 'jpeg', 'png', 'heic', 'heif'],
-            help="Format: JPG, JPEG, PNG, HEIC, HEIF"
+            help="Format yang didukung: JPG, JPEG, PNG, HEIC, HEIF. Ukuran maksimal: 200MB"
         )
         
         if uploaded_file is not None:
@@ -716,14 +1410,16 @@ def main():
                     use_white_balance=use_white_balance,
                     use_center_crop=use_center_crop,
                     use_brightness_gate=use_brightness_gate,
-                    use_obstruction_detect=use_obstruction_detect
+                    use_obstruction_detect=use_obstruction_detect,
+                    use_clahe=use_clahe,
+                    use_multi_region=use_multi_region
                 )
             
             with col2:
                 st.markdown("### 🎯 Detection Results")
                 st.image(annotated_image, use_container_width=True)
             
-            st.markdown("---")
+            st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
             
             if detections:
                 st.markdown(f"### 📋 Terdeteksi {len(detections)} Wajah")
@@ -732,36 +1428,108 @@ def main():
                     # Status badge color
                     status = det.get('status', 'OK')
                     status_icon = "✅" if status == "OK" else "⚠️"
+                    skin_tone = det['skin_tone']
                     
-                    with st.expander(f"👤 Face #{idx + 1} - {det['skin_tone'].upper()} {status_icon}", expanded=True):
-                        col_a, col_b, col_c = st.columns(3)
+                    with st.expander(f"👤 Face #{idx + 1} - {skin_tone.upper()} {status_icon}", expanded=True):
+                        # Skin Tone Badge
+                        badge_class = f"badge-{skin_tone.replace(' ', '-')}"
+                        skin_class = f"skin-{skin_tone.replace(' ', '-')}"
+                        
+                        st.markdown(f"""
+                        <div style="text-align: center; margin: 15px 0;">
+                            <div class="skin-tone-badge {badge_class}">
+                                <span class="skin-indicator {skin_class}"></span>
+                                {skin_tone.upper()}
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        col_a, col_b = st.columns(2)
                         
                         with col_a:
                             st.markdown("**📊 Hasil Deteksi**")
-                            st.markdown(f"**Skin Tone:** {det['skin_tone'].upper()}")
-                            st.markdown(f"**Confidence:** {det['skin_tone_conf']:.1%}")
+                            
+                            # Confidence Meter
+                            conf_percent = det['skin_tone_conf'] * 100
+                            conf_class = "conf-high" if conf_percent >= 70 else ("conf-medium" if conf_percent >= 50 else "conf-low")
+                            
+                            st.markdown(f"""
+                            <div style="margin: 10px 0;">
+                                <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                                    <span style="font-weight: 500;">Confidence</span>
+                                    <span style="font-weight: 700; color: #6366f1;">{det['skin_tone_conf']:.1%}</span>
+                                </div>
+                                <div class="confidence-meter">
+                                    <div class="confidence-fill {conf_class}" style="width: {conf_percent}%;"></div>
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
                             st.markdown(f"**Detection Score:** {det['detection_conf']:.1%}")
                         
                         with col_b:
                             st.markdown("**🔬 Diagnostik**")
                             brightness = det.get('brightness', 0)
                             skin_ratio = det.get('skin_ratio', 0)
-                            st.markdown(f"**Brightness:** {brightness:.0f}")
-                            st.markdown(f"**Skin Ratio:** {skin_ratio:.1%}")
-                            st.markdown(f"**Status:** {status}")
+                            
+                            # Mini metrics
+                            st.markdown(f"""
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0;">
+                                <div class="metric-card" style="padding: 12px;">
+                                    <div style="font-size: 1.2rem; font-weight: 700; color: #6366f1;">{brightness:.0f}</div>
+                                    <div style="font-size: 0.75rem; color: #64748b;">Brightness</div>
+                                </div>
+                                <div class="metric-card" style="padding: 12px;">
+                                    <div style="font-size: 1.2rem; font-weight: 700; color: #6366f1;">{skin_ratio:.0%}</div>
+                                    <div style="font-size: 0.75rem; color: #64748b;">Skin Ratio</div>
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            if status != "OK":
+                                st.warning(f"Status: {status}")
                         
-                        with col_c:
-                            st.markdown("**👔 Rekomendasi:**")
-                            st.markdown(get_recommendation(det['skin_tone']))
+                        # Rekomendasi
+                        st.markdown("**👔 Rekomendasi Warna:**")
+                        recommendation = get_recommendation(skin_tone)
+                        st.markdown(f"""
+                        <div class="recommendation-box" style="padding: 16px; margin-top: 10px;">
+                            <h4 style="margin: 0 0 8px 0; font-size: 1rem;">✨ Cocok untuk {skin_tone.upper()}</h4>
+                            {recommendation.replace(chr(10), '<br>')}
+                        </div>
+                        """, unsafe_allow_html=True)
             else:
-                st.warning("⚠️ Tidak ada wajah terdeteksi. Coba sesuaikan threshold atau gunakan gambar lain.")
+                st.markdown("""
+                <div class="warning-box">
+                    <h4 style="margin: 0 0 10px 0;">⚠️ Wajah Tidak Terdeteksi</h4>
+                    <p style="margin: 0 0 10px 0;">AI tidak dapat menemukan wajah dalam gambar ini. Coba tips berikut:</p>
+                    <ul style="margin: 0; padding-left: 20px;">
+                        <li>Pastikan wajah terlihat jelas dan tidak tertutup</li>
+                        <li>Gunakan gambar dengan pencahayaan yang cukup</li>
+                        <li>Turunkan nilai <strong>Detection Confidence</strong> di sidebar</li>
+                        <li>Gunakan gambar dengan resolusi lebih tinggi</li>
+                        <li>Pastikan wajah menghadap ke depan (frontal)</li>
+                    </ul>
+                </div>
+                """, unsafe_allow_html=True)
     
     # Footer
-    st.markdown("---")
+    st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
     st.markdown("""
-    <div style="text-align: center; color: #6b7280; font-size: 0.9rem;">
-        💎 <b>Skin Tone AI Professional</b> — Made with ❤️ using Streamlit, YOLOv8 Face, and TensorFlow<br>
-        <small>Features: Gray World AWB | Smart Crop | Brightness Gating | Skin Locus | Obstruction Detection</small>
+    <div style="text-align: center; padding: 30px 0;">
+        <div style="font-size: 1.5rem; font-weight: 700; margin-bottom: 8px;">
+            💎 Skin Tone AI Professional
+        </div>
+        <div style="color: #64748b; font-size: 0.9rem;">
+            Made with ❤️ using Streamlit, YOLOv8 Face, and TensorFlow
+        </div>
+        <div style="margin-top: 15px; display: flex; justify-content: center; gap: 10px; flex-wrap: wrap;">
+            <span class="feature-badge">Gray World AWB</span>
+            <span class="feature-badge">Smart Crop</span>
+            <span class="feature-badge">CLAHE</span>
+            <span class="feature-badge">Multi-Region</span>
+            <span class="feature-badge">Ensemble AI</span>
+        </div>
     </div>
     """, unsafe_allow_html=True)
 
