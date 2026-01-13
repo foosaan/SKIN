@@ -35,7 +35,7 @@ def load_models():
         yolo_path = os.path.join(BASE_PATH, "YOLOv8n Face.pt")
         yolo_model = YOLO(yolo_path)
     if skin_model is None:
-        skin_path = os.path.join(BASE_PATH, "Skin Tone Model v2.h5")
+        skin_path = os.path.join(BASE_PATH, "Skin_Tone_Model_v3.h5")
         skin_model = tf.keras.models.load_model(skin_path)
     return yolo_model, skin_model
 
@@ -82,6 +82,37 @@ def create_skin_mask(img):
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     return mask
+
+def extract_skin_color(face_crop):
+    """
+    Extract average skin color from face crop using skin mask.
+    Returns hex color code and RGB values.
+    """
+    # Create skin mask
+    mask = create_skin_mask(face_crop)
+    
+    # Apply mask to get only skin pixels
+    skin_pixels = face_crop[mask > 0]
+    
+    if len(skin_pixels) == 0:
+        # Fallback: use center region average
+        h, w = face_crop.shape[:2]
+        center = face_crop[h//4:3*h//4, w//4:3*w//4]
+        avg_color = np.mean(center, axis=(0, 1))
+    else:
+        # Calculate average color of skin pixels
+        avg_color = np.mean(skin_pixels, axis=0)
+    
+    # Convert BGR to RGB
+    b, g, r = int(avg_color[0]), int(avg_color[1]), int(avg_color[2])
+    
+    # Convert to hex
+    hex_color = '#{:02x}{:02x}{:02x}'.format(r, g, b)
+    
+    return {
+        'hex': hex_color,
+        'rgb': {'r': r, 'g': g, 'b': b}
+    }
 
 def get_multi_region_crops(frame, x1, y1, x2, y2):
     """Ambil multiple regions dari wajah"""
@@ -500,11 +531,30 @@ def analyze_image(img_bgr, use_multi_region=True, use_clahe=True, use_white_bala
     global yolo_model, skin_model
     load_models()
     
+    MAX_FACES = 2  # Maksimal wajah yang bisa dideteksi
+    
     results = []
     annotated = img_bgr.copy()
     
     # Detect faces
     detections = yolo_model(img_bgr, verbose=False)
+    
+    # Count valid faces first
+    valid_faces = []
+    for r in detections:
+        for box in r.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            w_box, h_box = x2 - x1, y2 - y1
+            if w_box >= MIN_FACE_SIZE and h_box >= MIN_FACE_SIZE:
+                valid_faces.append(box)
+    
+    # Check if too many faces
+    if len(valid_faces) > MAX_FACES:
+        return {
+            'error': True,
+            'message': f'Terdeteksi {len(valid_faces)} wajah. Sistem hanya dapat mendeteksi maksimal {MAX_FACES} orang.',
+            'face_count': len(valid_faces)
+        }
     
     for r in detections:
         for box in r.boxes:
@@ -532,6 +582,24 @@ def analyze_image(img_bgr, use_multi_region=True, use_clahe=True, use_white_bala
             # Skin visibility check
             mask = create_skin_mask(face_center)
             skin_ratio = cv2.countNonZero(mask) / (mask.size + 1e-5)
+            
+            # Generate skin mask visualization (colored overlay)
+            mask_colored = np.zeros_like(face_center)
+            mask_colored[mask > 0] = [0, 255, 0]  # Green for detected skin
+            mask_overlay = cv2.addWeighted(face_center, 0.7, mask_colored, 0.3, 0)
+            _, mask_buffer = cv2.imencode('.jpg', mask_overlay)
+            skin_mask_base64 = base64.b64encode(mask_buffer).decode('utf-8')
+            
+            # Validation details
+            is_valid = is_bright_ok and skin_ratio >= SKIN_RATIO_MIN
+            validation_details = {
+                'brightness_value': round(brightness, 1),
+                'brightness_status': bright_msg,
+                'brightness_ok': is_bright_ok,
+                'skin_ratio_percent': round(skin_ratio * 100, 1),
+                'skin_ratio_ok': skin_ratio >= SKIN_RATIO_MIN,
+                'is_valid': is_valid
+            }
             
             # Prediction
             if use_multi_region:
@@ -567,8 +635,11 @@ def analyze_image(img_bgr, use_multi_region=True, use_clahe=True, use_white_bala
                 'confidence': skin_conf,
                 'brightness': brightness,
                 'skin_ratio': skin_ratio,
+                'skin_color': extract_skin_color(face_center),
                 'recommendation': get_recommendation_with_scores(skin_label),
-                'bbox': [x1, y1, x2, y2]
+                'bbox': [x1, y1, x2, y2],
+                'skin_mask': f'data:image/jpeg;base64,{skin_mask_base64}',
+                'validation': validation_details
             })
     
     # Encode annotated image
